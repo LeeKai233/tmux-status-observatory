@@ -35,6 +35,20 @@ cd tmux-status-observatory
 - `./bin/tmux-status-observatory --detail`：查看数据源和缓存诊断。
 - `./install.sh --uninstall`：删除安装器加入的 tmux 配置区块。
 
+## 动画演示
+
+下面的窄幅录屏展示状态栏的常态、预报展开与收缩，以及覆盖整条状态栏的 sweep 扫光动画：
+
+![tmux 状态栏展开预报与 sweep 扫光演示](assets/tmux-status-observatory.gif)
+
+录制脚本使用当前配置和缓存数据，并在临时 tmux socket 中运行，不会连接或修改正在使用的 tmux server。安装 `asciinema`、`agg` 和 `Noto Sans Mono CJK SC` 后，在交互式终端执行：
+
+```bash
+make record-demo
+```
+
+GIF 默认写入 `assets/tmux-status-observatory.gif`。可通过 `TMUX_STATUS_DEMO_OUTPUT` 指定其他输出路径；脚本不会把 API key 或缓存写入仓库。
+
 ## 开发
 
 仓库是唯一源码来源，不需要复制到 `~/.local/bin`。修改后运行：
