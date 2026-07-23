@@ -86,7 +86,7 @@ class SweepTransitionTests(unittest.TestCase):
 
     def test_display_width_is_unicode_aware(self):
         self.assertEqual(SWEEP.build_layout("周四").width, 4)
-        self.assertEqual(SWEEP.build_layout("🐼").width, 2)
+        self.assertEqual(SWEEP.build_layout("测").width, 2)
 
 
 if __name__ == "__main__":

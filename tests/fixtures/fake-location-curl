@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [[ -n "${FAKE_CURL_LOG:-}" ]]; then
+    printf '%s\n' "$*" >>"$FAKE_CURL_LOG"
+fi
+
+case "${FAKE_LOCATION_MODE:-ok}" in
+    ok)
+        printf '%s\n' '{"success":true,"latitude":30.82422,"longitude":104.16022}'
+        ;;
+    invalid)
+        printf '%s\n' '{"success":true,"latitude":"unknown","longitude":104.16022}'
+        ;;
+    fail)
+        exit 22
+        ;;
+    *)
+        printf 'unknown fake location mode\n' >&2
+        exit 2
+        ;;
+esac

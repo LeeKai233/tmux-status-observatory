@@ -12,6 +12,151 @@ MARK_END='# <<< tmux-status-observatory <<<'
 usage() {
     printf 'Usage: %s [--dry-run]\n' "${0##*/}"
     printf '       %s --uninstall [--dry-run]\n' "${0##*/}"
+    printf '       %s --no-auto-location\n' "${0##*/}"
+}
+
+AUTO_LOCATION_URL='https://ipwho.is/?fields=success,message,city,region,country_code,latitude,longitude'
+CURL_BIN=${CURL_BIN:-curl}
+AUTO_LOCATION=1
+
+config_value() {
+    local key=$1
+    [[ -r "$ENV_FILE" ]] || return 0
+    (
+        set +u
+        # shellcheck disable=SC1090
+        source "$ENV_FILE"
+        printf '%s' "${!key-}"
+    )
+}
+
+coordinates_valid() {
+    [[ "$1" =~ ^-?[0-9]+([.][0-9]+)?$ && "$2" =~ ^-?[0-9]+([.][0-9]+)?$ ]]
+}
+
+write_env_values() {
+    local temp key1 value1 key2 value2 key3 value3
+    key1=$1
+    value1=$2
+    key2=${3:-}
+    value2=${4:-}
+    key3=${5:-}
+    value3=${6:-}
+    temp=$(mktemp "${ENV_FILE}.tmp.XXXXXX")
+
+    awk -v key1="$key1" -v value1="$value1" -v key2="$key2" -v value2="$value2" -v key3="$key3" -v value3="$value3" '
+        function assignment(key, value) { return key "=\"" value "\"" }
+        $0 ~ "^[[:space:]]*" key1 "[[:space:]]*=" {
+            print assignment(key1, value1)
+            found1 = 1
+            next
+        }
+        key2 != "" && $0 ~ "^[[:space:]]*" key2 "[[:space:]]*=" {
+            print assignment(key2, value2)
+            found2 = 1
+            next
+        }
+        key3 != "" && $0 ~ "^[[:space:]]*" key3 "[[:space:]]*=" {
+            print assignment(key3, value3)
+            found3 = 1
+            next
+        }
+        { print }
+        END {
+            if (!found1) print assignment(key1, value1)
+            if (key2 != "" && !found2) print assignment(key2, value2)
+            if (key3 != "" && !found3) print assignment(key3, value3)
+        }
+    ' "$ENV_FILE" >"$temp"
+
+    if cmp -s "$temp" "$ENV_FILE"; then
+        rm -f -- "$temp"
+        return 0
+    fi
+
+    local backup
+    backup="${ENV_FILE}.tmux-status-observatory.$(date +%Y%m%d%H%M%S).bak"
+    cp -p -- "$ENV_FILE" "$backup"
+    chmod 600 "$backup" 2>/dev/null || true
+    mv -f -- "$temp" "$ENV_FILE"
+    chmod 600 "$ENV_FILE" 2>/dev/null || true
+    printf 'Updated user config: %s (backup: %s)\n' "$ENV_FILE" "$backup"
+}
+
+detect_location() {
+    local response latitude longitude
+    response=$(mktemp "${TMPDIR:-/tmp}/tmux-status-observatory-location.XXXXXX")
+    if ! "$CURL_BIN" --fail --silent --show-error --location --compressed \
+        --connect-timeout 4 --max-time 10 "$AUTO_LOCATION_URL" >"$response" 2>/dev/null; then
+        rm -f -- "$response"
+        return 1
+    fi
+
+    if ! jq -e '
+        .success == true
+        and (.latitude | type == "number")
+        and (.longitude | type == "number")
+        and (.latitude >= -90 and .latitude <= 90)
+        and (.longitude >= -180 and .longitude <= 180)
+    ' "$response" >/dev/null 2>&1; then
+        rm -f -- "$response"
+        return 1
+    fi
+
+    latitude=$(jq -r '.latitude' "$response")
+    longitude=$(jq -r '.longitude' "$response")
+    rm -f -- "$response"
+    printf '%s\t%s\n' "$longitude" "$latitude"
+}
+
+auto_configure_location() {
+    local current_label current_longitude current_latitude detected longitude latitude label_placeholder=0
+    (( AUTO_LOCATION )) || return 0
+
+    current_label=$(config_value STATUS_LOCATION_LABEL)
+    current_longitude=$(config_value STATUS_LONGITUDE)
+    current_latitude=$(config_value STATUS_LATITUDE)
+
+    if [[ "$current_label" == 'Your City' ]]; then
+        label_placeholder=1
+        current_label=''
+    fi
+    if coordinates_valid "$current_longitude" "$current_latitude"; then
+        (( label_placeholder )) && write_env_values STATUS_LOCATION_LABEL ''
+        return 0
+    fi
+
+    if ! detected=$(detect_location); then
+        printf 'Location auto-detection failed; kept %s unchanged.\n' "$ENV_FILE" >&2
+        printf 'Set STATUS_LONGITUDE and STATUS_LATITUDE manually, or rerun without --no-auto-location.\n' >&2
+        return 0
+    fi
+    IFS=$'\t' read -r longitude latitude <<<"$detected"
+    if (( label_placeholder )); then
+        write_env_values STATUS_LOCATION_LABEL '' STATUS_LONGITUDE "$longitude" STATUS_LATITUDE "$latitude"
+    else
+        write_env_values STATUS_LONGITUDE "$longitude" STATUS_LATITUDE "$latitude"
+    fi
+    printf 'Auto-detected approximate coordinates: %s, %s\n' "$longitude" "$latitude"
+}
+
+print_credential_help() {
+    local qweather_host qweather_key nasa_key
+    qweather_host=$(config_value QWEATHER_API_HOST)
+    qweather_key=$(config_value QWEATHER_API_KEY)
+    nasa_key=$(config_value NASA_API_KEY)
+    if [[ -z "$qweather_host" || -z "$qweather_key" ]]; then
+        printf '\nQWeather setup:\n'
+        printf '  Create a project and API KEY: https://console.qweather.com/project\n'
+        printf '  Copy your private API Host: https://console.qweather.com/setting\n'
+        printf '  Official setup guide: https://dev.qweather.com/docs/configuration/project-and-key/\n'
+        printf '  Store QWEATHER_API_HOST and QWEATHER_API_KEY in %s\n' "$ENV_FILE"
+    fi
+    if [[ -z "$nasa_key" || "$nasa_key" == DEMO_KEY ]]; then
+        printf '\nNASA setup (optional; DEMO_KEY remains available):\n'
+        printf '  Request a personal key: https://api.nasa.gov/#signUp\n'
+        printf '  Store NASA_API_KEY in %s\n' "$ENV_FILE"
+    fi
 }
 
 tmux_quote() {
@@ -122,6 +267,7 @@ while (($#)); do
     case "$1" in
         --dry-run) dry_run=1 ;;
         --uninstall) uninstall=1 ;;
+        --no-auto-location) AUTO_LOCATION=0 ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; exit 2 ;;
     esac
@@ -147,10 +293,12 @@ fi
 
 write_install_block
 write_env_template
+auto_configure_location
 if [[ "${TMUX_STATUS_SKIP_RELOAD:-0}" != 1 ]] && tmux list-sessions >/dev/null 2>&1; then
     tmux run-shell "$ROOT_DIR/tmux-status-observatory.tmux"
     printf 'Loaded tmux-status-observatory into the running tmux server.\n'
 else
     printf 'The configuration will load when tmux starts.\n'
 fi
-printf 'Next: edit %s and set your location and QWeather API key.\n' "$ENV_FILE"
+printf 'Next: edit %s and set your QWeather API Host and API key.\n' "$ENV_FILE"
+print_credential_help
