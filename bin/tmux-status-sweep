@@ -337,12 +337,20 @@ def transition_text(layout: TransitionLayout, phase: float, direction: str) -> s
     return "".join((*layout.prefix, visible, *layout.suffix))
 
 
-def read_transition_payload() -> TransitionPayload:
-    fields = sys.stdin.buffer.read().split(b"\0")
+def parse_transition_payload(raw: bytes) -> TransitionPayload:
+    fields = raw.split(b"\0")
     if fields and fields[-1] == b"":
         fields.pop()
     if len(fields) != 12:
         raise ValueError("expected twelve NUL-separated status strings")
+    range_markers = (
+        b"#[range=user|weather]",
+        b"##[range=user|weather]",
+        b"#[norange]",
+        b"##[norange]",
+    )
+    if any(marker in frame for frame in fields[:6] for marker in range_markers):
+        raise ValueError("forecast transition frames must be plain text")
     names = ("narrow", "medium", "wide")
     closed = {
         name: build_layout(raw.decode("utf-8", "replace"))
@@ -365,6 +373,10 @@ def read_transition_payload() -> TransitionPayload:
         for name, raw in zip(names, fields[9:])
     }
     return TransitionPayload(layouts, fixed_right_frames, target_frames)
+
+
+def read_transition_payload() -> TransitionPayload:
+    return parse_transition_payload(sys.stdin.buffer.read())
 
 
 def clear_animation(session: str, token: str) -> bool:

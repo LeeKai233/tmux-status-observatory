@@ -888,8 +888,10 @@ run_forecast_toggle() {
     fps=$(global_option_or_default @status_forecast_transition_fps 60)
     duration=$(global_option_or_default @status_forecast_transition_duration 0.55)
     {
-        render_status_triplet 0 1 left
-        render_status_triplet 1 1 left
+        # Animated left frames must stay plain: tmux range markers are zero-width
+        # controls in settled frames, but the sweep renderer escapes them as text.
+        render_status_triplet 0 0 left
+        render_status_triplet 1 0 left
         render_status_triplet "$next" 1 right
         render_status_triplet "$next" 1 full
     } | "$SWEEP_RENDERER" transition \
