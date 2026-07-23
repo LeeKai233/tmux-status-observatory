@@ -61,6 +61,7 @@ reset_session_runtime
 plain_frames='#{?#{>=:#{client_width},180},#{E:@status_plain_frame_wide},#{?#{>=:#{client_width},120},#{E:@status_plain_frame_medium},#{E:@status_plain_frame_narrow}}}'
 sweep_frames='#{?#{>=:#{client_width},180},#{E:@status_sweep_frame_wide},#{?#{>=:#{client_width},120},#{E:@status_sweep_frame_medium},#{E:@status_sweep_frame_narrow}}}'
 forecast_frames='#{?#{>=:#{client_width},180},#{E:@status_forecast_left_wide}#{E:@status_forecast_right_wide},#{?#{>=:#{client_width},120},#{E:@status_forecast_left_medium}#{E:@status_forecast_right_medium},#{E:@status_forecast_left_narrow}#{E:@status_forecast_right_narrow}}}'
+forecast_toggle_command="$renderer_command --toggle-forecast '#{session_id}' #{client_width}"
 
 status_right="#{?#{==:#{@status_animation_kind},forecast},$forecast_frames,#{?#{==:#{@status_animation_kind},sweep},$sweep_frames,#{?#{@status_plain_ready},$plain_frames,#($renderer_command --status '#{session_id}' #{client_width})}}}#{?#{@status_animation_kind},,#{?#{@status_forecast_transition_pending},,#($renderer_command --status '#{session_id}' #{client_width} >/dev/null 2>&1)}} "
 
@@ -82,9 +83,9 @@ tmux set-option -g @status_forecast_transition_fps "$(global_option_or_default @
 tmux set-option -g @status_forecast_transition_duration "$(global_option_or_default @status_forecast_transition_duration 0.55)"
 
 tmux bind-key a run-shell -b "$renderer_command --sweep '#{session_id}'"
-tmux bind-key W run-shell -b "$renderer_command --toggle-forecast '#{session_id}' #{client_width}"
+tmux bind-key W run-shell -b "$forecast_toggle_command"
 tmux bind-key -n MouseDown1Status \
     if-shell -F '#{==:#{mouse_status_range},weather}' \
-    "run-shell -b $renderer_command --toggle-forecast '#{session_id}' #{client_width}" \
+    "run-shell -b \"$forecast_toggle_command\"" \
     'switch-client -t ='
 tmux unbind-key g

@@ -7,7 +7,8 @@ check:
 	bash -n bin/tmux-status-observatory tmux-status-observatory.tmux install.sh
 	$(PYTHON) -m py_compile bin/tmux-status-sweep tests/test_sweep.py
 	command -v shellcheck >/dev/null
-	shellcheck bin/tmux-status-observatory tmux-status-observatory.tmux install.sh
+	shellcheck bin/tmux-status-observatory tmux-status-observatory.tmux install.sh tests/test_tmux_binding.sh
+	bash tests/test_tmux_binding.sh
 	$(PYTHON) -m unittest discover -s tests -v
 
 install:
