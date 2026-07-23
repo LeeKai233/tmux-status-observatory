@@ -1,0 +1,1047 @@
+#!/usr/bin/env bash
+
+set -u
+umask 077
+
+CONFIG_FILE="${TMUX_STATUS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/tmux/status.env}"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/tmux-status"
+LOCK_FILE="$CACHE_DIR/refresh.lock"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SWEEP_RENDERER="${TMUX_STATUS_SWEEP_RENDERER:-$SCRIPT_DIR/tmux-status-sweep}"
+FORECAST_OPTION='@status_forecast_expanded'
+TRANSITION_OPTION='@status_forecast_transition_pending'
+ANIMATION_KIND_OPTION='@status_animation_kind'
+PLAIN_READY_OPTION='@status_plain_ready'
+PLAIN_FRAME_OPTIONS=(
+    '@status_plain_frame_narrow'
+    '@status_plain_frame_medium'
+    '@status_plain_frame_wide'
+)
+
+mkdir -p "$CACHE_DIR"
+chmod 700 "$CACHE_DIR" 2>/dev/null || true
+
+if [[ -r "$CONFIG_FILE" ]]; then
+    # This file is user-owned and mode 600; it intentionally uses shell assignments.
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+fi
+
+STATUS_LOCATION_LABEL="${STATUS_LOCATION_LABEL-}"
+STATUS_LONGITUDE="${STATUS_LONGITUDE:-}"
+STATUS_LATITUDE="${STATUS_LATITUDE:-}"
+QWEATHER_LOCATION_ID="${QWEATHER_LOCATION_ID:-}"
+QWEATHER_API_HOST="${QWEATHER_API_HOST:-devapi.qweather.com}"
+QWEATHER_API_KEY="${QWEATHER_API_KEY:-}"
+NASA_API_KEY="${NASA_API_KEY:-DEMO_KEY}"
+NASA_LOOKBACK_DAYS="${NASA_LOOKBACK_DAYS:-3}"
+
+QWEATHER_API_HOST="${QWEATHER_API_HOST#https://}"
+QWEATHER_API_HOST="${QWEATHER_API_HOST#http://}"
+QWEATHER_API_HOST="${QWEATHER_API_HOST%/}"
+
+LOCATION_CACHE_KEY=$(printf '%s' "${QWEATHER_LOCATION_ID:-coordinates}-$STATUS_LONGITUDE-$STATUS_LATITUDE" |
+    tr -c '[:alnum:]_.-' '_')
+QW_NOW_CACHE="$CACHE_DIR/qweather-now-$LOCATION_CACHE_KEY.json"
+QW_HOURLY_CACHE="$CACHE_DIR/qweather-hourly-$LOCATION_CACHE_KEY.json"
+QW_DAILY_CACHE="$CACHE_DIR/qweather-daily-$LOCATION_CACHE_KEY.json"
+QW_MOON_CACHE="$CACHE_DIR/qweather-moon-$LOCATION_CACHE_KEY.json"
+QW_AIR_CACHE="$CACHE_DIR/qweather-air-$LOCATION_CACHE_KEY.json"
+QW_GEO_CACHE="$CACHE_DIR/qweather-geo-$LOCATION_CACHE_KEY.json"
+ASTRO_CACHE="$CACHE_DIR/7timer-astro-$LOCATION_CACHE_KEY.json"
+DATA_SNAPSHOT="$CACHE_DIR/data-$LOCATION_CACHE_KEY.env"
+NASA_GST_CACHE="$CACHE_DIR/nasa-gst.json"
+NASA_FLR_CACHE="$CACHE_DIR/nasa-flr.json"
+
+QW_NOW_TTL=1200
+QW_HOURLY_TTL=1800
+QW_DAILY_TTL=21600
+QW_MOON_TTL=21600
+QW_AIR_TTL=3600
+QW_GEO_TTL=2592000
+ASTRO_TTL=10800
+NASA_TTL=10800
+DATA_SNAPSHOT_TTL=30
+
+qweather_configured() {
+    [[ -n "$QWEATHER_API_HOST" && -n "$QWEATHER_API_KEY" ]] || return 1
+    [[ -n "$QWEATHER_LOCATION_ID" ]] || coordinates_configured
+}
+
+coordinates_configured() {
+    [[ "$STATUS_LONGITUDE" =~ ^-?[0-9]+([.][0-9]+)?$ && "$STATUS_LATITUDE" =~ ^-?[0-9]+([.][0-9]+)?$ ]]
+}
+
+qweather_location() {
+    if [[ -n "$QWEATHER_LOCATION_ID" ]]; then
+        printf '%s' "$QWEATHER_LOCATION_ID"
+    else
+        printf '%s,%s' "$STATUS_LONGITUDE" "$STATUS_LATITUDE"
+    fi
+}
+
+cache_fresh() {
+    local file=$1 ttl=$2 modified now
+    [[ -s "$file" ]] || return 1
+    modified=$(stat -c %Y -- "$file" 2>/dev/null) || return 1
+    now=$(date +%s)
+    (( now - modified < ttl ))
+}
+
+moon_cache_is_today() {
+    local today
+    [[ -s "$QW_MOON_CACHE" ]] || return 1
+    today=$(date +%F)
+    jq -e --arg today "$today" '.code == "200" and any(.moonPhase[]?; (.fxTime // "") | startswith($today))' "$QW_MOON_CACHE" >/dev/null 2>&1
+}
+
+daily_cache_is_today() {
+    local today
+    [[ -s "$QW_DAILY_CACHE" ]] || return 1
+    today=$(date +%F)
+    jq -e --arg today "$today" '.code == "200" and any(.daily[]?; .fxDate == $today)' "$QW_DAILY_CACHE" >/dev/null 2>&1
+}
+
+fetch_json() {
+    local target=$1 validator=$2 tmp
+    shift 2
+    tmp=$(mktemp "$CACHE_DIR/.fetch.XXXXXX") || return 1
+
+    if curl --fail --silent --show-error --location --compressed --connect-timeout 4 --max-time 15 "$@" >"$tmp" 2>/dev/null && jq -e "$validator" "$tmp" >/dev/null 2>&1; then
+        mv -f -- "$tmp" "$target"
+        return 0
+    fi
+
+    rm -f -- "$tmp"
+    return 1
+}
+
+refresh_qweather() {
+    local force=$1 location today base header
+    qweather_configured || return 0
+
+    location=$(qweather_location)
+    today=$(date +%Y%m%d)
+    base="https://$QWEATHER_API_HOST"
+    header="X-QW-Api-Key: $QWEATHER_API_KEY"
+
+    if (( force )) || ! cache_fresh "$QW_NOW_CACHE" "$QW_NOW_TTL"; then
+        fetch_json "$QW_NOW_CACHE" '.code == "200" and (.now | type == "object")' -H "$header" -G "$base/v7/weather/now" --data-urlencode "location=$location" --data-urlencode 'lang=zh' || true
+    fi
+
+    if (( force )) || ! cache_fresh "$QW_HOURLY_CACHE" "$QW_HOURLY_TTL"; then
+        fetch_json "$QW_HOURLY_CACHE" '.code == "200" and (.hourly | type == "array") and ((.hourly | length) > 0)' -H "$header" -G "$base/v7/weather/24h" --data-urlencode "location=$location" --data-urlencode 'lang=zh' --data-urlencode 'unit=m' || true
+    fi
+
+    if (( force )) || ! cache_fresh "$QW_DAILY_CACHE" "$QW_DAILY_TTL" || ! daily_cache_is_today; then
+        fetch_json "$QW_DAILY_CACHE" '.code == "200" and ((.daily | length) > 0)' -H "$header" -G "$base/v7/weather/3d" --data-urlencode "location=$location" --data-urlencode 'lang=zh' || true
+    fi
+
+    if (( force )) || ! cache_fresh "$QW_MOON_CACHE" "$QW_MOON_TTL" || ! moon_cache_is_today; then
+        fetch_json "$QW_MOON_CACHE" '.code == "200" and ((.moonPhase | length) > 0)' -H "$header" -G "$base/v7/astronomy/moon" --data-urlencode "location=$location" --data-urlencode "date=$today" --data-urlencode 'lang=zh' || true
+    fi
+
+    if coordinates_configured && { (( force )) || ! cache_fresh "$QW_AIR_CACHE" "$QW_AIR_TTL"; }; then
+        fetch_json "$QW_AIR_CACHE" '(.indexes | type == "array") and ((.indexes | length) > 0) and (.pollutants | type == "array")' -H "$header" -G "$base/airquality/v1/current/$STATUS_LATITUDE/$STATUS_LONGITUDE" --data-urlencode 'lang=zh' || true
+    fi
+
+    if coordinates_configured && [[ -z "$STATUS_LOCATION_LABEL" ]] && { (( force )) || ! cache_fresh "$QW_GEO_CACHE" "$QW_GEO_TTL"; }; then
+        fetch_json "$QW_GEO_CACHE" '.code == "200" and ((.location | length) > 0)' -H "$header" -G "$base/geo/v2/city/lookup" --data-urlencode "location=$STATUS_LONGITUDE,$STATUS_LATITUDE" --data-urlencode 'lang=zh' --data-urlencode 'number=1' || true
+    fi
+}
+
+refresh_astro() {
+    local force=$1
+    coordinates_configured || return 0
+    if (( force )) || ! cache_fresh "$ASTRO_CACHE" "$ASTRO_TTL"; then
+        fetch_json "$ASTRO_CACHE" '(.dataseries | type == "array") and ((.dataseries | length) > 0)' -G 'https://www.7timer.info/bin/api.pl' --data-urlencode "lon=$STATUS_LONGITUDE" --data-urlencode "lat=$STATUS_LATITUDE" --data-urlencode 'product=astro' --data-urlencode 'output=json' || true
+    fi
+}
+
+refresh_nasa() {
+    local force=$1 start_date end_date endpoint target
+    if (( ! force )) && cache_fresh "$NASA_GST_CACHE" "$NASA_TTL" && cache_fresh "$NASA_FLR_CACHE" "$NASA_TTL"; then
+        return 0
+    fi
+
+    start_date=$(date -u -d "$NASA_LOOKBACK_DAYS days ago" +%F)
+    end_date=$(date -u +%F)
+    for endpoint in GST FLR; do
+        if [[ "$endpoint" == GST ]]; then
+            target=$NASA_GST_CACHE
+        else
+            target=$NASA_FLR_CACHE
+        fi
+        if (( force )) || ! cache_fresh "$target" "$NASA_TTL"; then
+            fetch_json "$target" 'type == "array"' -G "https://api.nasa.gov/DONKI/$endpoint" --data-urlencode "startDate=$start_date" --data-urlencode "endDate=$end_date" --data-urlencode "api_key=$NASA_API_KEY" || true
+        fi
+    done
+}
+
+needs_refresh() {
+    if qweather_configured; then
+        cache_fresh "$QW_NOW_CACHE" "$QW_NOW_TTL" || return 0
+        cache_fresh "$QW_HOURLY_CACHE" "$QW_HOURLY_TTL" || return 0
+        cache_fresh "$QW_DAILY_CACHE" "$QW_DAILY_TTL" || return 0
+        daily_cache_is_today || return 0
+        cache_fresh "$QW_MOON_CACHE" "$QW_MOON_TTL" || return 0
+        moon_cache_is_today || return 0
+        if coordinates_configured && [[ -z "$STATUS_LOCATION_LABEL" ]]; then
+            cache_fresh "$QW_GEO_CACHE" "$QW_GEO_TTL" || return 0
+        fi
+        if coordinates_configured; then
+            cache_fresh "$QW_AIR_CACHE" "$QW_AIR_TTL" || return 0
+        fi
+    fi
+    if coordinates_configured; then
+        cache_fresh "$ASTRO_CACHE" "$ASTRO_TTL" || return 0
+    fi
+    cache_fresh "$NASA_GST_CACHE" "$NASA_TTL" || return 0
+    cache_fresh "$NASA_FLR_CACHE" "$NASA_TTL" || return 0
+    return 1
+}
+
+refresh_all() {
+    local force=$1 wait_for_lock=${2:-0}
+    exec 9>"$LOCK_FILE"
+    if (( wait_for_lock )); then
+        flock -w 20 9 || return 1
+    else
+        flock -n 9 || return 0
+    fi
+    refresh_qweather "$force"
+    refresh_astro "$force"
+    refresh_nasa "$force"
+}
+
+cache_value() {
+    local file=$1 filter=$2
+    [[ -s "$file" ]] || return 0
+    jq -r "($filter) // empty" "$file" 2>/dev/null || true
+}
+
+daily_cache_value() {
+    local field=$1 today
+    [[ -s "$QW_DAILY_CACHE" ]] || return 0
+    today=$(date +%F)
+    jq -r --arg today "$today" --arg field "$field" \
+        '(([.daily[]? | select(.fxDate == $today)][0] // {})[$field]) // empty' \
+        "$QW_DAILY_CACHE" 2>/dev/null || true
+}
+
+score_label() {
+    local score=$1
+    if (( score >= 85 )); then
+        printf '优'
+    elif (( score >= 70 )); then
+        printf '良'
+    elif (( score >= 50 )); then
+        printf '中'
+    else
+        printf '差'
+    fi
+}
+
+condition_level() {
+    local value=$1
+    [[ "$value" =~ ^[1-8]$ ]] || return 0
+    if (( value <= 2 )); then
+        printf '优'
+    elif (( value <= 4 )); then
+        printf '良'
+    elif (( value <= 6 )); then
+        printf '中'
+    else
+        printf '差'
+    fi
+}
+
+weather_emoji() {
+    case "$1" in
+        '') ;;
+        100) printf '☀️' ;;
+        150) printf '🌙' ;;
+        101|151) printf '⛅' ;;
+        102|103|152|153) printf '🌤️' ;;
+        104) printf '☁️' ;;
+        300|350|305|309|314) printf '🌦️' ;;
+        301|351|306|307|308|310|311|312|315|316|317|318|399) printf '🌧️' ;;
+        302|303|304) printf '⛈️' ;;
+        313) printf '🧊' ;;
+        400|401|404|405|406|407|408|456|457) printf '🌨️' ;;
+        402|403|409|410|499) printf '❄️' ;;
+        500|501|502|509|510|511|512|513|514|515) printf '🌫️' ;;
+        503|504) printf '💨' ;;
+        507|508) printf '🌪️' ;;
+        900) printf '🥵' ;;
+        901) printf '🥶' ;;
+        *) printf '❔' ;;
+    esac
+}
+
+moon_emoji() {
+    case "$1" in
+        800) printf '🌑' ;;
+        801) printf '🌒' ;;
+        802) printf '🌓' ;;
+        803) printf '🌔' ;;
+        804) printf '🌕' ;;
+        805) printf '🌖' ;;
+        806) printf '🌗' ;;
+        807) printf '🌘' ;;
+        '') ;;
+        *) printf '🌙' ;;
+    esac
+}
+
+aqi_category_from_value() {
+    local value=$1
+    [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 0
+    if (( ${value%.*} <= 50 )); then
+        printf '优'
+    elif (( ${value%.*} <= 100 )); then
+        printf '良'
+    elif (( ${value%.*} <= 150 )); then
+        printf '轻度污染'
+    elif (( ${value%.*} <= 200 )); then
+        printf '中度污染'
+    elif (( ${value%.*} <= 300 )); then
+        printf '重度污染'
+    else
+        printf '严重污染'
+    fi
+}
+
+aqi_emoji() {
+    local category=$1 value=$2
+    case "$category" in
+        优|Excellent) printf '🟢' ;;
+        良|Good) printf '🟡' ;;
+        轻度污染) printf '🟠' ;;
+        中度污染) printf '🔴' ;;
+        重度污染) printf '🟣' ;;
+        严重污染) printf '🟤' ;;
+        *)
+            category=$(aqi_category_from_value "$value")
+            case "$category" in
+                优) printf '🟢' ;;
+                良) printf '🟡' ;;
+                轻度污染) printf '🟠' ;;
+                中度污染) printf '🔴' ;;
+                重度污染) printf '🟣' ;;
+                严重污染) printf '🟤' ;;
+                *) printf '⚪' ;;
+            esac
+            ;;
+    esac
+}
+
+normalize_pollutant() {
+    case "$1" in
+        O3|'O 3') printf 'O₃' ;;
+        'PM 2.5') printf 'PM2.5' ;;
+        'PM 10') printf 'PM10' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+weekday_name() {
+    case "$(date +%u)" in
+        1) printf '周一' ;;
+        2) printf '周二' ;;
+        3) printf '周三' ;;
+        4) printf '周四' ;;
+        5) printf '周五' ;;
+        6) printf '周六' ;;
+        7) printf '周日' ;;
+    esac
+}
+
+seeing_range() {
+    case "$1" in
+        1) printf '<0.5″' ;;
+        2) printf '0.5–0.75″' ;;
+        3) printf '0.75–1″' ;;
+        4) printf '1–1.25″' ;;
+        5) printf '1.25–1.5″' ;;
+        6) printf '1.5–2″' ;;
+        7) printf '2–2.5″' ;;
+        8) printf '>2.5″' ;;
+        *) printf -- '--' ;;
+    esac
+}
+
+transparency_range() {
+    case "$1" in
+        1) printf '<0.3' ;;
+        2) printf '0.3–0.4' ;;
+        3) printf '0.4–0.5' ;;
+        4) printf '0.5–0.6' ;;
+        5) printf '0.6–0.7' ;;
+        6) printf '0.7–0.85' ;;
+        7) printf '0.85–1' ;;
+        8) printf '>1' ;;
+        *) printf -- '--' ;;
+    esac
+}
+
+calculate_score() {
+    jq -nr --arg qcloud "$Q_CLOUD" --arg visibility "$Q_VISIBILITY" --arg humidity "$Q_HUMIDITY" --arg precipitation "$Q_PRECIPITATION" --arg acloud "$ASTRO_CLOUD" --arg arh "$ASTRO_HUMIDITY" --arg aprecip "$ASTRO_PRECIPITATION" --arg seeing "$ASTRO_SEEING" --arg transparency "$ASTRO_TRANSPARENCY" '
+            def num($v): if $v == "" then null else try ($v | tonumber) catch null end;
+            def clamp: if . < 0 then 0 elif . > 100 then 100 else . end;
+            def cloud_from_code($v):
+                if $v == null or $v < 1 or $v > 9 then null
+                else [3, 13, 25, 38, 50, 63, 75, 88, 97][($v | floor) - 1]
+                end;
+            (num($qcloud)) as $qc |
+            (num($acloud)) as $ac |
+            (num($visibility)) as $vis |
+            (num($humidity)) as $qh |
+            (num($arh)) as $ahcode |
+            (num($precipitation)) as $rain |
+            (num($seeing)) as $see |
+            (num($transparency)) as $trans |
+            ($qc // cloud_from_code($ac)) as $cloud |
+            ($qh // (if $ahcode == null then null
+                     elif $ahcode >= 16 then 100
+                     else ($ahcode * 5 + 22.5) end)) as $rh |
+            [
+                if $cloud == null then empty else {w: 40, s: ((100 - $cloud) | clamp)} end,
+                if $vis == null then empty else {w: 15, s: (($vis / 20 * 100) | clamp)} end,
+                if $rh == null then empty else
+                    {w: 10, s: ((if $rh <= 40 then 100 else (100 - (($rh - 40) / 60 * 100)) end) | clamp)}
+                end,
+                if $rain != null then {w: 10, s: ((100 - $rain * 50) | clamp)}
+                elif $aprecip != "" then {w: 10, s: (if $aprecip == "none" then 100 else 0 end)}
+                else empty end,
+                if $see == null then empty else {w: 15, s: (((8 - $see) / 7 * 100) | clamp)} end,
+                if $trans == null then empty else {w: 10, s: (((8 - $trans) / 7 * 100) | clamp)} end
+            ] as $parts |
+            if ($parts | length) == 0 then empty
+            else (((($parts | map(.s * .w) | add) / ($parts | map(.w) | add)) + 0.5) | floor | tostring)
+            end
+        '
+}
+
+STATUS_SNAPSHOT_VARS=(
+    Q_TEMP Q_TEXT Q_ICON Q_CLOUD Q_VISIBILITY Q_HUMIDITY Q_PRECIPITATION
+    Q_HOURLY_1_TIME Q_HOURLY_1_TEMP Q_HOURLY_1_TEXT Q_HOURLY_1_POP
+    Q_HOURLY_2_TIME Q_HOURLY_2_TEMP Q_HOURLY_2_TEXT Q_HOURLY_2_POP
+    Q_HOURLY_FORECAST
+    Q_SUNRISE Q_SUNSET WEATHER_EMOJI DISPLAY_LOCATION LOCATION_EMOJI
+    AQ_VALUE AQ_CATEGORY AQ_PRIMARY AQ_EMOJI
+    AQ_PM25 AQ_PM25_UNIT AQ_PM10 AQ_PM10_UNIT AQ_O3 AQ_O3_UNIT
+    ASTRO_CLOUD ASTRO_HUMIDITY ASTRO_PRECIPITATION ASTRO_SEEING ASTRO_TRANSPARENCY
+    ASTRO_SEEING_LABEL ASTRO_TRANSPARENCY_LABEL
+    MOON_NAME MOON_ILLUMINATION MOON_ICON MOON_EMOJI
+    STAR_SCORE STAR_LABEL NASA_KP NASA_FLARE NASA_STATUS
+)
+
+write_data_snapshot() {
+    local tmp variable
+    tmp=$(mktemp "$CACHE_DIR/.data.XXXXXX") || return 0
+    {
+        printf 'STATUS_SNAPSHOT_VERSION=2\n'
+        for variable in "${STATUS_SNAPSHOT_VARS[@]}"; do
+            printf '%s=%q\n' "$variable" "${!variable}"
+        done
+    } >"$tmp" || {
+        rm -f -- "$tmp"
+        return 0
+    }
+    mv -f -- "$tmp" "$DATA_SNAPSHOT" || rm -f -- "$tmp"
+}
+
+session_forecast_state() {
+    local session=$1 value
+    value=$(tmux show-option -qv -t "$session" "$FORECAST_OPTION" 2>/dev/null || true)
+    [[ "$value" == 1 ]] && printf '1' || printf '0'
+}
+
+load_hourly_forecast() {
+    local now_epoch fx_time fx_epoch temp text pop
+
+    Q_HOURLY_1_TIME=''
+    Q_HOURLY_1_TEMP=''
+    Q_HOURLY_1_TEXT=''
+    Q_HOURLY_1_POP=''
+    Q_HOURLY_2_TIME=''
+    Q_HOURLY_2_TEMP=''
+    Q_HOURLY_2_TEXT=''
+    Q_HOURLY_2_POP=''
+    Q_HOURLY_FORECAST=''
+
+    [[ -s "$QW_HOURLY_CACHE" ]] || return 0
+    now_epoch=$(date +%s)
+    while IFS=$'\t' read -r fx_time temp text pop; do
+        [[ -n "$fx_time" && -n "$temp" && -n "$text" && -n "$pop" ]] || continue
+        fx_epoch=$(date -d "$fx_time" +%s 2>/dev/null) || continue
+        (( fx_epoch > now_epoch )) || continue
+
+        if [[ -z "$Q_HOURLY_1_TIME" ]]; then
+            Q_HOURLY_1_TIME="$fx_time"
+            Q_HOURLY_1_TEMP="$temp"
+            Q_HOURLY_1_TEXT="$text"
+            Q_HOURLY_1_POP="$pop"
+        elif [[ -z "$Q_HOURLY_2_TIME" ]]; then
+            Q_HOURLY_2_TIME="$fx_time"
+            Q_HOURLY_2_TEMP="$temp"
+            Q_HOURLY_2_TEXT="$text"
+            Q_HOURLY_2_POP="$pop"
+            break
+        fi
+    done < <(jq -r '.hourly[]? | [(.fxTime // ""), (.temp // ""), (.text // ""), (.pop // "")] | @tsv' "$QW_HOURLY_CACHE" 2>/dev/null)
+
+    if [[ -n "$Q_HOURLY_1_TIME" ]]; then
+        Q_HOURLY_FORECAST="${Q_HOURLY_1_TEMP}°C${Q_HOURLY_1_TEXT}·${Q_HOURLY_1_POP}%雨"
+        if [[ -n "$Q_HOURLY_2_TIME" ]]; then
+            Q_HOURLY_FORECAST+=" ${Q_HOURLY_2_TEMP}°C${Q_HOURLY_2_TEXT}·${Q_HOURLY_2_POP}%雨"
+        fi
+    fi
+}
+
+load_data() {
+    local today hour geo_name geo_adm2 primary
+
+    if cache_fresh "$DATA_SNAPSHOT" "$DATA_SNAPSHOT_TTL"; then
+        # shellcheck disable=SC1090
+        source "$DATA_SNAPSHOT"
+        [[ "${STATUS_SNAPSHOT_VERSION:-}" == 2 && "${Q_HOURLY_FORECAST+x}" == x ]] && return 0
+    fi
+
+    Q_TEMP=$(cache_value "$QW_NOW_CACHE" '.now.temp')
+    Q_TEXT=$(cache_value "$QW_NOW_CACHE" '.now.text')
+    Q_ICON=$(cache_value "$QW_NOW_CACHE" '.now.icon')
+    Q_CLOUD=$(cache_value "$QW_NOW_CACHE" '.now.cloud')
+    Q_VISIBILITY=$(cache_value "$QW_NOW_CACHE" '.now.vis')
+    Q_HUMIDITY=$(cache_value "$QW_NOW_CACHE" '.now.humidity')
+    Q_PRECIPITATION=$(cache_value "$QW_NOW_CACHE" '.now.precip')
+    load_hourly_forecast
+    Q_SUNRISE=$(daily_cache_value 'sunrise')
+    Q_SUNSET=$(daily_cache_value 'sunset')
+    WEATHER_EMOJI=$(weather_emoji "$Q_ICON")
+
+    DISPLAY_LOCATION="$STATUS_LOCATION_LABEL"
+    geo_name=$(cache_value "$QW_GEO_CACHE" '.location[0].name')
+    geo_adm2=$(cache_value "$QW_GEO_CACHE" '.location[0].adm2')
+    if [[ -z "$DISPLAY_LOCATION" ]]; then
+        if [[ -n "$geo_name" && -n "$geo_adm2" && "$geo_name" != "$geo_adm2" ]]; then
+            DISPLAY_LOCATION="$geo_adm2·$geo_name"
+        elif [[ -n "$geo_name" ]]; then
+            DISPLAY_LOCATION="$geo_name"
+        elif coordinates_configured; then
+            DISPLAY_LOCATION="$STATUS_LATITUDE,$STATUS_LONGITUDE"
+        else
+            DISPLAY_LOCATION='未配置地点'
+        fi
+    fi
+    if [[ -n "$STATUS_LOCATION_LABEL" ]]; then
+        if [[ "$STATUS_LOCATION_LABEL" == 成都* ]]; then
+            LOCATION_EMOJI='🐼'
+        else
+            LOCATION_EMOJI='📌'
+        fi
+    elif [[ "$geo_adm2" == 成都 ]]; then
+        LOCATION_EMOJI='🐼'
+    else
+        LOCATION_EMOJI='📌'
+    fi
+
+    AQ_VALUE=$(cache_value "$QW_AIR_CACHE" '([.indexes[]? | select(.code == "cn-mee")][0] // .indexes[0] // {}).aqi')
+    AQ_CATEGORY=$(cache_value "$QW_AIR_CACHE" '([.indexes[]? | select(.code == "cn-mee")][0] // .indexes[0] // {}).category')
+    primary=$(cache_value "$QW_AIR_CACHE" '([.indexes[]? | select(.code == "cn-mee")][0] // .indexes[0] // {}).primaryPollutant.name')
+    AQ_PRIMARY=$(normalize_pollutant "$primary")
+    if [[ -n "$AQ_VALUE" && -z "$AQ_CATEGORY" ]]; then
+        AQ_CATEGORY=$(aqi_category_from_value "$AQ_VALUE")
+    fi
+    if [[ -n "$AQ_VALUE" ]]; then
+        AQ_EMOJI=$(aqi_emoji "$AQ_CATEGORY" "$AQ_VALUE")
+    else
+        AQ_EMOJI=''
+    fi
+    AQ_PM25=$(cache_value "$QW_AIR_CACHE" '[.pollutants[]? | select(.code == "pm2p5")][0].concentration.value')
+    AQ_PM25_UNIT=$(cache_value "$QW_AIR_CACHE" '[.pollutants[]? | select(.code == "pm2p5")][0].concentration.unit')
+    AQ_PM10=$(cache_value "$QW_AIR_CACHE" '[.pollutants[]? | select(.code == "pm10")][0].concentration.value')
+    AQ_PM10_UNIT=$(cache_value "$QW_AIR_CACHE" '[.pollutants[]? | select(.code == "pm10")][0].concentration.unit')
+    AQ_O3=$(cache_value "$QW_AIR_CACHE" '[.pollutants[]? | select(.code == "o3")][0].concentration.value')
+    AQ_O3_UNIT=$(cache_value "$QW_AIR_CACHE" '[.pollutants[]? | select(.code == "o3")][0].concentration.unit')
+
+    ASTRO_CLOUD=$(cache_value "$ASTRO_CACHE" '.dataseries[0].cloudcover')
+    ASTRO_HUMIDITY=$(cache_value "$ASTRO_CACHE" '.dataseries[0].rh2m')
+    ASTRO_PRECIPITATION=$(cache_value "$ASTRO_CACHE" '.dataseries[0].prec_type')
+    ASTRO_SEEING=$(cache_value "$ASTRO_CACHE" '.dataseries[0].seeing')
+    ASTRO_TRANSPARENCY=$(cache_value "$ASTRO_CACHE" '.dataseries[0].transparency')
+    ASTRO_SEEING_LABEL=$(condition_level "$ASTRO_SEEING")
+    ASTRO_TRANSPARENCY_LABEL=$(condition_level "$ASTRO_TRANSPARENCY")
+
+    MOON_NAME=''
+    MOON_ILLUMINATION=''
+    MOON_ICON=''
+    if moon_cache_is_today; then
+        today=$(date +%F)
+        hour=$(date +%H)
+        MOON_NAME=$(jq -r --arg today "$today" --arg hour "$hour" '
+            [.moonPhase[]? | select((.fxTime // "") | startswith($today))] |
+            ((map(select(.fxTime[11:13] == $hour))[0] // .[0]) // {}) |
+            .name // empty
+        ' "$QW_MOON_CACHE" 2>/dev/null) || MOON_NAME=''
+        MOON_ILLUMINATION=$(jq -r --arg today "$today" --arg hour "$hour" '
+            [.moonPhase[]? | select((.fxTime // "") | startswith($today))] |
+            ((map(select(.fxTime[11:13] == $hour))[0] // .[0]) // {}) |
+            .illumination // empty
+        ' "$QW_MOON_CACHE" 2>/dev/null) || MOON_ILLUMINATION=''
+        MOON_ICON=$(jq -r --arg today "$today" --arg hour "$hour" '
+            [.moonPhase[]? | select((.fxTime // "") | startswith($today))] |
+            ((map(select(.fxTime[11:13] == $hour))[0] // .[0]) // {}) |
+            .icon // empty
+        ' "$QW_MOON_CACHE" 2>/dev/null) || MOON_ICON=''
+    fi
+    MOON_EMOJI=$(moon_emoji "$MOON_ICON")
+
+    STAR_SCORE=$(calculate_score)
+    if [[ -n "$STAR_SCORE" ]]; then
+        STAR_LABEL=$(score_label "$STAR_SCORE")
+    else
+        STAR_LABEL=''
+    fi
+
+    NASA_KP=$(cache_value "$NASA_GST_CACHE" '
+        [.[].allKpIndex[]?.kpIndex | tonumber?] | max |
+        if . == null or . < 5 then empty
+        elif . == floor then tostring
+        else ((. * 10 | round) / 10 | tostring) end
+    ')
+    # The dollar-prefixed names below are jq variables, not shell expansions.
+    # shellcheck disable=SC2016
+    NASA_FLARE=$(cache_value "$NASA_FLR_CACHE" '
+        [.[] |
+            (.classType // "") as $class |
+            select($class | test("^[MX][0-9]")) |
+            ($class | capture("(?<letter>[MX])(?<number>[0-9.]+)")) as $m |
+            {class: $class,
+             rank: ((if $m.letter == "X" then 100 else 0 end) + ($m.number | tonumber))}
+        ] |
+        if length == 0 then empty else max_by(.rank).class end
+    ')
+
+    NASA_STATUS=''
+    if [[ -n "$NASA_FLARE" ]]; then
+        NASA_STATUS="$NASA_FLARE"
+    fi
+    if [[ -n "$NASA_KP" ]]; then
+        if [[ -n "$NASA_STATUS" ]]; then
+            NASA_STATUS="$NASA_STATUS Kp$NASA_KP"
+        else
+            NASA_STATUS="Kp$NASA_KP"
+        fi
+    fi
+    write_data_snapshot
+}
+
+join_parts() {
+    local separator='' part
+    for part in "$@"; do
+        printf '%s%s' "$separator" "$part"
+        separator=' | '
+    done
+}
+
+air_status() {
+    local category=''
+    [[ -n "$AQ_CATEGORY" ]] && category="·$AQ_CATEGORY"
+    printf 'AQI%s%s' "$AQ_VALUE" "$category"
+    [[ -n "$AQ_PRIMARY" ]] && printf ' %s' "$AQ_PRIMARY"
+}
+
+STATUS_LEFT_SEGMENT=''
+STATUS_RIGHT_SEGMENT=''
+STATUS_FULL_SEGMENT=''
+STATUS_CLOCK_OVERRIDE=''
+
+build_status_segments() {
+    local width=${1:-160}
+    local show_forecast=${2:-0} interactive=${3:-0}
+    local weather weather_compact sun air moon stars clock left
+    local -a right_parts=()
+    [[ "$width" =~ ^[0-9]+$ ]] || width=160
+    [[ "$show_forecast" == 1 ]] || show_forecast=0
+    [[ "$interactive" == 1 ]] || interactive=0
+
+    if [[ -n "$STATUS_CLOCK_OVERRIDE" ]]; then
+        clock="$STATUS_CLOCK_OVERRIDE"
+    else
+        clock="$(date '+%H:%M %Y-%m-%d') $(weekday_name)"
+    fi
+    weather="$DISPLAY_LOCATION"
+    weather_compact="$weather"
+    if [[ -n "$Q_TEMP" ]]; then
+        weather="$weather ${Q_TEMP}°C"
+        weather_compact="$weather_compact ${Q_TEMP}°C"
+        [[ -n "$Q_TEXT" ]] && weather="$weather$Q_TEXT" && weather_compact="$weather_compact$Q_TEXT"
+    elif qweather_configured; then
+        weather="$weather 天气暂缺"
+        weather_compact="$weather_compact 天气暂缺"
+    else
+        weather="$weather 和风待配置"
+        weather_compact="$weather_compact 和风待配置"
+    fi
+
+    if (( interactive )); then
+        weather="#[range=user|weather]$weather#[norange]"
+        weather_compact="#[range=user|weather]$weather_compact#[norange]"
+    fi
+
+    sun=''
+    [[ -n "$Q_SUNRISE" ]] && sun="日出 $Q_SUNRISE"
+    [[ -n "$Q_SUNSET" ]] && sun="${sun:+$sun }日落 $Q_SUNSET"
+
+    if (( width >= 180 )); then
+        left="$weather"
+        if (( show_forecast )) && [[ -n "$Q_HOURLY_FORECAST" ]]; then
+            left+=" | $Q_HOURLY_FORECAST"
+        fi
+        [[ -n "$sun" ]] && right_parts+=("$sun")
+        if [[ -n "$AQ_VALUE" ]]; then
+            air="$(air_status)"
+            right_parts+=("$air")
+        fi
+        if [[ -n "$MOON_NAME" ]]; then
+            moon="月相 $MOON_NAME"
+            [[ -n "$MOON_ILLUMINATION" ]] && moon="$moon $MOON_ILLUMINATION%"
+            right_parts+=("$moon")
+        fi
+        stars=''
+        if [[ -n "$STAR_SCORE$ASTRO_SEEING$ASTRO_TRANSPARENCY" ]]; then
+            [[ -n "$STAR_SCORE" ]] && stars="${stars:+$stars }星$STAR_SCORE$STAR_LABEL"
+            [[ -n "$ASTRO_SEEING" ]] && stars="${stars:+$stars }视$ASTRO_SEEING$ASTRO_SEEING_LABEL"
+            [[ -n "$ASTRO_TRANSPARENCY" ]] && stars="${stars:+$stars }透$ASTRO_TRANSPARENCY$ASTRO_TRANSPARENCY_LABEL"
+            right_parts+=("$stars")
+        fi
+        [[ -n "$NASA_STATUS" ]] && right_parts+=("NASA $NASA_STATUS")
+    elif (( width >= 120 )); then
+        left="$weather_compact"
+        if (( show_forecast )) && [[ -n "$Q_HOURLY_FORECAST" ]]; then
+            left+=" | $Q_HOURLY_FORECAST"
+        fi
+        [[ -n "$sun" ]] && right_parts+=("$sun")
+        [[ -n "$AQ_VALUE" ]] && right_parts+=("$(air_status)")
+        [[ -n "$MOON_ILLUMINATION" ]] && right_parts+=("月相 $MOON_ILLUMINATION%")
+        [[ -n "$STAR_SCORE" ]] && right_parts+=("星$STAR_SCORE$STAR_LABEL")
+        [[ -n "$NASA_STATUS" ]] && right_parts+=("NASA $NASA_STATUS")
+    else
+        left="$weather_compact"
+    fi
+
+    right_parts+=("$clock")
+    STATUS_LEFT_SEGMENT="$left"
+    STATUS_RIGHT_SEGMENT=" | $(join_parts "${right_parts[@]}")"
+    STATUS_FULL_SEGMENT="$STATUS_LEFT_SEGMENT$STATUS_RIGHT_SEGMENT"
+}
+
+render_plain_status() {
+    build_status_segments "${1:-160}" "${2:-0}" "${3:-0}"
+    printf '%s' "$STATUS_FULL_SEGMENT"
+}
+
+render_status_segment() {
+    local width=${1:-160} show_forecast=${2:-0} interactive=${3:-0} segment=${4:-full}
+    build_status_segments "$width" "$show_forecast" "$interactive"
+    case "$segment" in
+        left) printf '%s' "$STATUS_LEFT_SEGMENT" ;;
+        right) printf '%s' "$STATUS_RIGHT_SEGMENT" ;;
+        full) printf '%s' "$STATUS_FULL_SEGMENT" ;;
+        *) return 1 ;;
+    esac
+}
+
+render_status() {
+    local width=${1:-160}
+    local show_forecast=${2:-0}
+    [[ "$width" =~ ^[0-9]+$ ]] || width=160
+    render_plain_status "$width" "$show_forecast" 1
+}
+
+session_cache_key() {
+    printf '%s' "$1" | tr -c '[:alnum:]_.-' '_'
+}
+
+global_option_or_default() {
+    local option=$1 default=$2 value
+    value=$(tmux show-option -gqv "$option" 2>/dev/null || true)
+    printf '%s' "${value:-$default}"
+}
+
+render_status_triplet() {
+    local show_forecast=${1:-0} interactive=${2:-0} segment=${3:-full}
+    local narrow medium wide
+    narrow=$(render_status_segment 100 "$show_forecast" "$interactive" "$segment")
+    medium=$(render_status_segment 150 "$show_forecast" "$interactive" "$segment")
+    wide=$(render_status_segment 200 "$show_forecast" "$interactive" "$segment")
+    printf '%s\0%s\0%s\0' "$narrow" "$medium" "$wide"
+}
+
+write_session_status_frames() {
+    # Keep the settled view in session options so a stale #() result never
+    # becomes visible while a transition hands control back to status-right.
+    local session=${1:-} show_forecast=${2:-0} force=${3:-0} frame active pending
+    local -a frames=()
+
+    [[ -n "$session" ]] || return 0
+    if [[ "$force" != 1 ]]; then
+        active=$(tmux show-option -qv -t "$session" @status_sweep_active 2>/dev/null || true)
+        pending=$(tmux show-option -qv -t "$session" "$TRANSITION_OPTION" 2>/dev/null || true)
+        [[ "$active" == 1 || "$pending" == 1 ]] && return 0
+    fi
+    while IFS= read -r -d '' frame; do
+        frames+=("$frame")
+    done < <(render_status_triplet "$show_forecast" 1)
+    (( ${#frames[@]} == 3 )) || return 1
+
+    if [[ "$force" != 1 ]]; then
+        active=$(tmux show-option -qv -t "$session" @status_sweep_active 2>/dev/null || true)
+        pending=$(tmux show-option -qv -t "$session" "$TRANSITION_OPTION" 2>/dev/null || true)
+        [[ "$active" == 1 || "$pending" == 1 ]] && return 0
+    fi
+    tmux set-option -q -t "$session" "${PLAIN_FRAME_OPTIONS[0]}" "${frames[0]}" || return 1
+    tmux set-option -q -t "$session" "${PLAIN_FRAME_OPTIONS[1]}" "${frames[1]}" || return 1
+    tmux set-option -q -t "$session" "${PLAIN_FRAME_OPTIONS[2]}" "${frames[2]}" || return 1
+    tmux set-option -q -t "$session" "$PLAIN_READY_OPTION" 1
+}
+
+stop_active_sweep() {
+    local session=$1 kind
+    [[ -x "$SWEEP_RENDERER" ]] || return 0
+    kind=$(tmux show-option -qv -t "$session" "$ANIMATION_KIND_OPTION" 2>/dev/null || true)
+    [[ "$kind" == sweep ]] || return 0
+    "$SWEEP_RENDERER" stop --session "$session" --kind sweep >/dev/null 2>&1 || true
+}
+
+run_status_sweep() {
+    local session=${1:-} session_key lock_file fps speed half_width show_forecast kind
+
+    [[ -x "$SWEEP_RENDERER" ]] || return 1
+    if [[ -z "$session" ]]; then
+        session=$(tmux display-message -p '#{session_id}' 2>/dev/null || true)
+    fi
+    [[ -n "$session" ]] || return 1
+    tmux has-session -t "$session" 2>/dev/null || return 1
+
+    session_key=$(session_cache_key "$session")
+    lock_file="$CACHE_DIR/sweep-$session_key.lock"
+    exec 8>"$lock_file"
+    flock -n 8 || return 0
+    kind=$(tmux show-option -qv -t "$session" "$ANIMATION_KIND_OPTION" 2>/dev/null || true)
+    [[ "$kind" != forecast ]] || return 0
+    [[ "$(tmux show-option -qv -t "$session" "$TRANSITION_OPTION" 2>/dev/null || true)" != 1 ]] || return 0
+
+    fps=$(global_option_or_default @status_sweep_fps 30)
+    speed=$(global_option_or_default @status_sweep_speed 30)
+    half_width=$(global_option_or_default @status_sweep_half_width 10)
+    show_forecast=$(session_forecast_state "$session")
+
+    if needs_refresh; then
+        (
+            exec 8>&-
+            "$0" --update </dev/null >/dev/null 2>&1
+        ) &
+    fi
+    load_data
+    write_session_status_frames "$session" "$show_forecast" 1 || return 1
+    render_status_triplet "$show_forecast" | "$SWEEP_RENDERER" animate \
+        --session "$session" \
+        --fps "$fps" \
+        --speed "$speed" \
+        --half-width "$half_width"
+}
+
+run_forecast_toggle() {
+    local session=${1:-} width=${2:-0} session_key lock_file current next direction fps duration
+
+    [[ "$width" =~ ^[0-9]+$ && "$width" -ge 120 ]] || return 0
+    [[ -n "$session" ]] || return 1
+    tmux has-session -t "$session" 2>/dev/null || return 1
+
+    session_key=$(session_cache_key "$session")
+    lock_file="$CACHE_DIR/sweep-$session_key.lock"
+    stop_active_sweep "$session"
+    exec 8>"$lock_file"
+    flock -w 2 8 || return 0
+
+    current=$(session_forecast_state "$session")
+    if [[ "$current" == 1 ]]; then
+        next=0
+        direction='collapse'
+    else
+        next=1
+        direction='expand'
+    fi
+
+    tmux set-option -q -t "$session" "$TRANSITION_OPTION" 1 || return 1
+    if needs_refresh; then
+        (
+            exec 8>&-
+            "$0" --update </dev/null >/dev/null 2>&1
+        ) &
+    fi
+    load_data
+    STATUS_CLOCK_OVERRIDE="$(date '+%H:%M %Y-%m-%d') $(weekday_name)"
+    fps=$(global_option_or_default @status_forecast_transition_fps 60)
+    duration=$(global_option_or_default @status_forecast_transition_duration 0.55)
+    {
+        render_status_triplet 0 1 left
+        render_status_triplet 1 1 left
+        render_status_triplet "$next" 1 right
+        render_status_triplet "$next" 1 full
+    } | "$SWEEP_RENDERER" transition \
+        --session "$session" \
+        --fps "$fps" \
+        --duration "$duration" \
+        --direction "$direction" \
+        --state-option "$FORECAST_OPTION" \
+        --state-value "$next"
+    local rc=${PIPESTATUS[1]}
+    tmux set-option -qu -t "$session" "$TRANSITION_OPTION" 2>/dev/null || true
+    tmux refresh-client -S 2>/dev/null || true
+    return "$rc"
+}
+
+maybe_trigger_auto_sweep() {
+    local session=$1 second minute session_key stamp_file auto_lock auto_fd previous=''
+
+    [[ -n "$session" ]] || return 0
+    second=$(date +%S)
+    (( 10#$second <= 3 )) || return 0
+
+    minute=$(date +%Y%m%d%H%M)
+    session_key=$(session_cache_key "$session")
+    stamp_file="$CACHE_DIR/auto-sweep-$session_key.stamp"
+    auto_lock="$CACHE_DIR/auto-sweep-$session_key.lock"
+
+    exec {auto_fd}>"$auto_lock"
+    if ! flock -n "$auto_fd"; then
+        exec {auto_fd}>&-
+        return 0
+    fi
+    if [[ -r "$stamp_file" ]]; then
+        IFS= read -r previous <"$stamp_file" || true
+    fi
+    if [[ "$previous" == "$minute" ]]; then
+        flock -u "$auto_fd"
+        exec {auto_fd}>&-
+        return 0
+    fi
+
+    printf '%s\n' "$minute" >"$stamp_file"
+    flock -u "$auto_fd"
+    exec {auto_fd}>&-
+    "$0" --sweep "$session" </dev/null >/dev/null 2>&1 &
+}
+
+cache_age_text() {
+    local file=$1 modified age
+    modified=$(stat -c %Y -- "$file" 2>/dev/null) || {
+        printf '无缓存'
+        return
+    }
+    age=$(( $(date +%s) - modified ))
+    if (( age < 60 )); then
+        printf '%s 秒前' "$age"
+    elif (( age < 3600 )); then
+        printf '%s 分钟前' "$(( age / 60 ))"
+    else
+        printf '%s 小时前' "$(( age / 3600 ))"
+    fi
+}
+
+hourly_time_label() {
+    date -d "$1" '+%m-%d %H:%M' 2>/dev/null || printf '%s' "$1"
+}
+
+hourly_detail_item() {
+    printf '%s %s°C%s·%s%%雨' "$(hourly_time_label "$1")" "$2" "$3" "$4"
+}
+
+render_detail() {
+    local sunrise sunset temp_min temp_max hourly_detail
+    sunrise=$(daily_cache_value 'sunrise')
+    sunset=$(daily_cache_value 'sunset')
+    temp_min=$(daily_cache_value 'tempMin')
+    temp_max=$(daily_cache_value 'tempMax')
+
+    printf '位置: %s%s (%s, %s；Location ID %s)\n' "$LOCATION_EMOJI" "$DISPLAY_LOCATION" "$STATUS_LONGITUDE" "$STATUS_LATITUDE" "${QWEATHER_LOCATION_ID:---}"
+    if qweather_configured; then
+        printf '和风天气: %s%s，%s°C，云量 %s%%，能见度 %s km，湿度 %s%%，降水 %s mm\n' "$WEATHER_EMOJI" "${Q_TEXT:-暂无数据}" "${Q_TEMP:---}" "${Q_CLOUD:---}" "${Q_VISIBILITY:---}" "${Q_HUMIDITY:---}" "${Q_PRECIPITATION:---}"
+        printf '今日: %s~%s°C，日出 %s，日落 %s\n' "${temp_min:---}" "${temp_max:---}" "${sunrise:---}" "${sunset:---}"
+        if [[ -n "$Q_HOURLY_1_TIME" ]]; then
+            hourly_detail=$(hourly_detail_item "$Q_HOURLY_1_TIME" "$Q_HOURLY_1_TEMP" "$Q_HOURLY_1_TEXT" "$Q_HOURLY_1_POP")
+            if [[ -n "$Q_HOURLY_2_TIME" ]]; then
+                hourly_detail+=" $(hourly_detail_item "$Q_HOURLY_2_TIME" "$Q_HOURLY_2_TEMP" "$Q_HOURLY_2_TEXT" "$Q_HOURLY_2_POP")"
+            fi
+            printf '未来两小时: %s，缓存 %s\n' "$hourly_detail" "$(cache_age_text "$QW_HOURLY_CACHE")"
+        else
+            printf '未来两小时: 暂无有效预报，缓存 %s\n' "$(cache_age_text "$QW_HOURLY_CACHE")"
+        fi
+        printf '月相: %s %s，照明度 %s%%\n' "$MOON_EMOJI" "${MOON_NAME:---}" "${MOON_ILLUMINATION:---}"
+        printf '空气质量: %s AQI %s %s，首要污染物 %s，缓存 %s\n' "${AQ_EMOJI:-⚪}" "${AQ_VALUE:---}" "${AQ_CATEGORY:---}" "${AQ_PRIMARY:---}" "$(cache_age_text "$QW_AIR_CACHE")"
+        printf '污染物: PM2.5 %s %s，PM10 %s %s，O₃ %s %s\n' "${AQ_PM25:---}" "$AQ_PM25_UNIT" "${AQ_PM10:---}" "$AQ_PM10_UNIT" "${AQ_O3:---}" "$AQ_O3_UNIT"
+    else
+        printf '和风天气: 未配置，请填写 %s\n' "$CONFIG_FILE"
+    fi
+    printf '7Timer Astro: 云量级 %s，视宁度 %s/8（%s，%s），透明度 %s/8（%s mag/airmass，%s），缓存 %s\n' "${ASTRO_CLOUD:---}" "${ASTRO_SEEING:---}" "$(seeing_range "$ASTRO_SEEING")" "${ASTRO_SEEING_LABEL:---}" "${ASTRO_TRANSPARENCY:---}" "$(transparency_range "$ASTRO_TRANSPARENCY")" "${ASTRO_TRANSPARENCY_LABEL:---}" "$(cache_age_text "$ASTRO_CACHE")"
+    printf '观星适合度: %s%s/100（大气条件；月光单列）\n' "${STAR_SCORE:---}" "$STAR_LABEL"
+    printf 'NASA DONKI: %s，缓存 %s\n' "${NASA_STATUS:-近 ${NASA_LOOKBACK_DAYS} 日无显著事件}" "$(cache_age_text "$NASA_FLR_CACHE")"
+    printf '数据来源: QWeather https://www.qweather.com | 7Timer | NASA DONKI\n'
+}
+
+case "${1:-}" in
+    --sweep)
+        run_status_sweep "${2:-}"
+        ;;
+    --status)
+        session=${2:-}
+        width=${3:-160}
+        show_forecast=${4:-}
+        if needs_refresh; then
+            "$0" --update </dev/null >/dev/null 2>&1 &
+        fi
+        load_data
+        if [[ "$show_forecast" != 1 ]]; then
+            show_forecast=$(session_forecast_state "$session")
+        fi
+        write_session_status_frames "$session" "$show_forecast" || true
+        render_status "$width" "$show_forecast"
+        maybe_trigger_auto_sweep "$session"
+        ;;
+    --plain-set)
+        show_forecast=${2:-0}
+        if needs_refresh; then
+            "$0" --update </dev/null >/dev/null 2>&1 &
+        fi
+        load_data
+        render_status_triplet "$show_forecast"
+        ;;
+    --toggle-forecast)
+        run_forecast_toggle "${2:-}" "${3:-0}"
+        ;;
+    --refresh)
+        refresh_all 1 1
+        printf '刷新检查完成；失败的数据源会继续使用旧缓存。\n'
+        ;;
+    --update)
+        refresh_all 0 0
+        ;;
+    --detail)
+        if needs_refresh; then
+            refresh_all 0 1
+        fi
+        load_data
+        render_detail
+        ;;
+    *)
+        if needs_refresh; then
+            "$0" --update </dev/null >/dev/null 2>&1 &
+        fi
+        load_data
+        render_status "${1:-160}"
+        ;;
+esac

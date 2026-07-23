@@ -1,0 +1,613 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import secrets
+import shlex
+import signal
+import subprocess
+import sys
+import time
+import unicodedata
+from dataclasses import dataclass
+from pathlib import Path
+
+
+ACTIVE_OPTION = "@status_sweep_active"
+TOKEN_OPTION = "@status_sweep_token"
+TRANSITION_OPTION = "@status_forecast_transition_pending"
+ANIMATION_KIND_OPTION = "@status_animation_kind"
+ANIMATION_PID_OPTION = "@status_animation_pid"
+PLAIN_READY_OPTION = "@status_plain_ready"
+PLAIN_FRAME_OPTIONS = {
+    "narrow": "@status_plain_frame_narrow",
+    "medium": "@status_plain_frame_medium",
+    "wide": "@status_plain_frame_wide",
+}
+FRAME_OPTIONS = {
+    "narrow": "@status_sweep_frame_narrow",
+    "medium": "@status_sweep_frame_medium",
+    "wide": "@status_sweep_frame_wide",
+}
+FORECAST_LEFT_FRAME_OPTIONS = {
+    "narrow": "@status_forecast_left_narrow",
+    "medium": "@status_forecast_left_medium",
+    "wide": "@status_forecast_left_wide",
+}
+FORECAST_RIGHT_FRAME_OPTIONS = {
+    "narrow": "@status_forecast_right_narrow",
+    "medium": "@status_forecast_right_medium",
+    "wide": "@status_forecast_right_wide",
+}
+CODEX_STOPS = (
+    (0.00, (0, 0, 0)),
+    (0.18, (68, 34, 57)),
+    (0.34, (86, 55, 76)),
+    (0.52, (133, 110, 125)),
+    (0.70, (190, 178, 186)),
+    (0.86, (237, 233, 236)),
+    (1.00, (255, 255, 255)),
+)
+
+
+@dataclass(frozen=True)
+class Glyph:
+    text: str
+    center: float
+    width: int
+
+
+@dataclass(frozen=True)
+class Layout:
+    glyphs: tuple[Glyph, ...]
+    width: int
+
+
+@dataclass(frozen=True)
+class TransitionLayout:
+    prefix: tuple[str, ...]
+    insertion: tuple[str, ...]
+    suffix: tuple[str, ...]
+    insertion_width: int
+
+
+@dataclass(frozen=True)
+class TransitionPayload:
+    layouts: dict[str, TransitionLayout]
+    fixed_right_frames: dict[str, str]
+    target_frames: dict[str, str]
+
+
+class AnimationInterrupted(Exception):
+    pass
+
+
+def interrupt_animation(_signum: int, _frame: object) -> None:
+    raise AnimationInterrupted
+
+
+def tmux_command(*args: str) -> bool:
+    result = subprocess.run(
+        ("tmux", *args),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def tmux_output(*args: str) -> tuple[bool, str]:
+    result = subprocess.run(
+        ("tmux", *args),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        text=True,
+    )
+    if result.returncode != 0:
+        return False, ""
+    return True, result.stdout.rstrip("\n")
+
+
+def sanitize_text(text: str) -> str:
+    cleaned: list[str] = []
+    for char in text:
+        if char in "\r\n\t":
+            cleaned.append(" ")
+        elif unicodedata.category(char) == "Cc":
+            continue
+        else:
+            cleaned.append(char)
+    return "".join(cleaned)
+
+
+def split_clusters(text: str) -> list[str]:
+    clusters: list[str] = []
+    current = ""
+    for char in text:
+        is_extension = (
+            bool(current)
+            and (
+                unicodedata.combining(char) != 0
+                or char in {"\ufe0e", "\ufe0f", "\u200d"}
+                or current.endswith("\u200d")
+            )
+        )
+        if not current or is_extension:
+            current += char
+        else:
+            clusters.append(current)
+            current = char
+    if current:
+        clusters.append(current)
+    return clusters
+
+
+def codepoint_width(char: str) -> int:
+    if unicodedata.combining(char) or char in {"\ufe0e", "\ufe0f", "\u200d"}:
+        return 0
+    if unicodedata.category(char).startswith("C"):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+
+
+def cluster_width(cluster: str) -> int:
+    widths = [codepoint_width(char) for char in cluster]
+    if "\u200d" in cluster:
+        return max(widths, default=1)
+    if len(cluster) == 2 and all("REGIONAL INDICATOR" in unicodedata.name(c, "") for c in cluster):
+        return 2
+    return max(1, sum(widths))
+
+
+def build_layout(text: str) -> Layout:
+    cursor = 0
+    glyphs: list[Glyph] = []
+    for cluster in split_clusters(sanitize_text(text)):
+        width = cluster_width(cluster)
+        glyphs.append(Glyph(cluster, cursor + width / 2.0, width))
+        cursor += width
+    return Layout(tuple(glyphs), cursor)
+
+
+def interpolate(start: tuple[int, int, int], end: tuple[int, int, int], amount: float) -> tuple[int, int, int]:
+    return tuple(round(a + (b - a) * amount) for a, b in zip(start, end))  # type: ignore[return-value]
+
+
+def codex_color(amount: float) -> tuple[int, int, int]:
+    for (left_pos, left_color), (right_pos, right_color) in zip(CODEX_STOPS, CODEX_STOPS[1:]):
+        if amount <= right_pos:
+            span = right_pos - left_pos
+            local = 0.0 if span == 0 else (amount - left_pos) / span
+            return interpolate(left_color, right_color, max(0.0, min(1.0, local)))
+    return CODEX_STOPS[-1][1]
+
+
+def color_for(amount: float) -> str:
+    amount = max(0.0, min(1.0, amount))
+    red, green, blue = codex_color(amount)
+    return f"#{red:02x}{green:02x}{blue:02x}"
+
+
+def tmux_literal(text: str) -> str:
+    return text.replace("#", "##")
+
+
+def render_frame(layout: Layout, center: float, half_width: float) -> str:
+    parts: list[str] = []
+    active_color = ""
+    for glyph in layout.glyphs:
+        distance = abs(glyph.center - center)
+        if distance >= half_width:
+            amount = 0.0
+        else:
+            amount = 0.5 * (1.0 + math.cos(math.pi * distance / half_width))
+        color = color_for(amount)
+        if color != active_color:
+            parts.append(f"#[fg={color}]")
+            active_color = color
+        parts.append(tmux_literal(glyph.text))
+    parts.append("#[fg=black]")
+    return "".join(parts)
+
+
+def set_initial_frames(session: str, token: str, frames: dict[str, str]) -> bool:
+    command: list[str] = []
+    for name in ("narrow", "medium", "wide"):
+        if command:
+            command.append(";")
+        command.extend(("set-option", "-q", "-t", session, FRAME_OPTIONS[name], frames[name]))
+    command.extend((";", "set-option", "-q", "-t", session, TOKEN_OPTION, token))
+    command.extend((";", "set-option", "-q", "-t", session, ANIMATION_KIND_OPTION, "sweep"))
+    command.extend((";", "set-option", "-q", "-t", session, ANIMATION_PID_OPTION, str(os.getpid())))
+    command.extend((";", "set-option", "-q", "-t", session, ACTIVE_OPTION, "1"))
+    return tmux_command(*command)
+
+
+def initialize_transition(
+    session: str,
+    token: str,
+    animation_left_frames: dict[str, str],
+    fixed_right_frames: dict[str, str],
+    target_frames: dict[str, str],
+    state_option: str,
+    state_value: str,
+) -> bool:
+    """Take over status-right before publishing the settled target frames."""
+    initial_command: list[str] = []
+    for name in ("narrow", "medium", "wide"):
+        if initial_command:
+            initial_command.append(";")
+        initial_command.extend(
+            ("set-option", "-q", "-t", session, FORECAST_LEFT_FRAME_OPTIONS[name], animation_left_frames[name])
+        )
+    initial_command.extend((";", "set-option", "-q", "-t", session, TOKEN_OPTION, token))
+    for name in ("narrow", "medium", "wide"):
+        initial_command.extend((";", "set-option", "-q", "-t", session, FORECAST_RIGHT_FRAME_OPTIONS[name], fixed_right_frames[name]))
+    initial_command.extend((";", "set-option", "-q", "-t", session, ANIMATION_KIND_OPTION, "forecast"))
+    initial_command.extend((";", "set-option", "-q", "-t", session, ANIMATION_PID_OPTION, str(os.getpid())))
+    initial_command.extend((";", "set-option", "-q", "-t", session, ACTIVE_OPTION, "1"))
+    if not tmux_command(*initial_command):
+        return False
+
+    target_command: list[str] = []
+    for name in ("narrow", "medium", "wide"):
+        if target_command:
+            target_command.append(";")
+        target_command.extend(
+            ("set-option", "-q", "-t", session, PLAIN_FRAME_OPTIONS[name], target_frames[name])
+        )
+    target_command.extend((";", "set-option", "-q", "-t", session, PLAIN_READY_OPTION, "1"))
+    if state_option:
+        target_command.extend((";", "set-option", "-q", "-t", session, state_option, state_value))
+    if tmux_command(*target_command):
+        return True
+    clear_animation(session, token)
+    return False
+
+
+def set_frames(session: str, frames: dict[str, str]) -> bool:
+    command: list[str] = []
+    for name in ("narrow", "medium", "wide"):
+        if command:
+            command.append(";")
+        command.extend(("set-option", "-q", "-t", session, FRAME_OPTIONS[name], frames[name]))
+    return tmux_command(*command)
+
+
+def set_transition_frames(session: str, frames: dict[str, str]) -> bool:
+    command: list[str] = []
+    for name in ("narrow", "medium", "wide"):
+        if command:
+            command.append(";")
+        command.extend(("set-option", "-q", "-t", session, FORECAST_LEFT_FRAME_OPTIONS[name], frames[name]))
+    return tmux_command(*command)
+
+
+def build_transition_layout(closed: Layout, opened: Layout) -> TransitionLayout:
+    closed_clusters = tuple(glyph.text for glyph in closed.glyphs)
+    opened_clusters = tuple(glyph.text for glyph in opened.glyphs)
+    suffix_length = 0
+    max_suffix = min(len(closed_clusters), len(opened_clusters))
+    while (
+        suffix_length < max_suffix
+        and closed_clusters[-(suffix_length + 1)] == opened_clusters[-(suffix_length + 1)]
+    ):
+        suffix_length += 1
+
+    if suffix_length:
+        closed_prefix = closed_clusters[:-suffix_length]
+        opened_prefix = opened_clusters[:-suffix_length]
+        suffix = closed_clusters[-suffix_length:]
+    else:
+        closed_prefix = closed_clusters
+        opened_prefix = opened_clusters
+        suffix = ()
+
+    if opened_prefix[: len(closed_prefix)] != closed_prefix:
+        raise ValueError("status strings do not form an insertion transition")
+    insertion = opened_prefix[len(closed_prefix) :]
+    insertion_width = sum(cluster_width(cluster) for cluster in insertion)
+    return TransitionLayout(closed_prefix, insertion, suffix, insertion_width)
+
+
+def insertion_prefix(layout: TransitionLayout, progress: float) -> tuple[str, int]:
+    progress = max(0.0, min(1.0, progress))
+    target_width = layout.insertion_width * progress
+    consumed = 0
+    visible: list[str] = []
+    for cluster in layout.insertion:
+        width = cluster_width(cluster)
+        if consumed + width > target_width + 1e-9:
+            break
+        visible.append(cluster)
+        consumed += width
+    return "".join(visible), consumed
+
+
+def transition_text(layout: TransitionLayout, phase: float, direction: str) -> str:
+    phase = max(0.0, min(1.0, phase))
+    progress = phase if direction == "expand" else 1.0 - phase
+    visible, _visible_width = insertion_prefix(layout, progress)
+    return "".join((*layout.prefix, visible, *layout.suffix))
+
+
+def read_transition_payload() -> TransitionPayload:
+    fields = sys.stdin.buffer.read().split(b"\0")
+    if fields and fields[-1] == b"":
+        fields.pop()
+    if len(fields) != 12:
+        raise ValueError("expected twelve NUL-separated status strings")
+    names = ("narrow", "medium", "wide")
+    closed = {
+        name: build_layout(raw.decode("utf-8", "replace"))
+        for name, raw in zip(names, fields[:3])
+    }
+    opened = {
+        name: build_layout(raw.decode("utf-8", "replace"))
+        for name, raw in zip(names, fields[3:])
+    }
+    layouts = {
+        name: build_transition_layout(closed[name], opened[name])
+        for name in names
+    }
+    fixed_right_frames = {
+        name: raw.decode("utf-8", "replace")
+        for name, raw in zip(names, fields[6:9])
+    }
+    target_frames = {
+        name: raw.decode("utf-8", "replace")
+        for name, raw in zip(names, fields[9:])
+    }
+    return TransitionPayload(layouts, fixed_right_frames, target_frames)
+
+
+def clear_animation(session: str, token: str) -> bool:
+    if not tmux_command("has-session", "-t", session):
+        return False
+    query_ok, current_token = tmux_output("show-option", "-qv", "-t", session, TOKEN_OPTION)
+    if not query_ok:
+        return False
+    if current_token != token:
+        return True
+    command: list[str] = []
+    for option in (
+        ACTIVE_OPTION,
+        TOKEN_OPTION,
+        TRANSITION_OPTION,
+        ANIMATION_KIND_OPTION,
+        ANIMATION_PID_OPTION,
+        *FRAME_OPTIONS.values(),
+        *FORECAST_LEFT_FRAME_OPTIONS.values(),
+        *FORECAST_RIGHT_FRAME_OPTIONS.values(),
+    ):
+        if command:
+            command.append(";")
+        command.extend(("set-option", "-qu", "-t", session, option))
+    return tmux_command(*command)
+
+
+def stop_animation(args: argparse.Namespace) -> int:
+    if not tmux_command("has-session", "-t", args.session):
+        return 1
+    kind_ok, kind = tmux_output("show-option", "-qv", "-t", args.session, ANIMATION_KIND_OPTION)
+    if not kind_ok or kind != args.kind:
+        return 0
+    pid_ok, pid_text = tmux_output("show-option", "-qv", "-t", args.session, ANIMATION_PID_OPTION)
+    if not pid_ok or not pid_text.isdigit():
+        return 0
+    pid = int(pid_text)
+    try:
+        command_line = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return 0
+    script = str(Path(__file__).resolve()).encode()
+    if script not in command_line or b"animate" not in command_line:
+        return 0
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    return 0
+
+
+def schedule_watchdog(session: str, token: str, timeout: float) -> bool:
+    script = str(Path(__file__).resolve())
+    clear_command = shlex.join((sys.executable, script, "clear", "--session", session, "--token", token))
+    shell_command = f"sleep {timeout:.3f}; {clear_command}"
+    return tmux_command("run-shell", "-b", shell_command)
+
+
+def read_layouts() -> dict[str, Layout]:
+    fields = sys.stdin.buffer.read().split(b"\0")
+    if fields and fields[-1] == b"":
+        fields.pop()
+    if len(fields) != 3:
+        raise ValueError("expected three NUL-separated status strings")
+    names = ("narrow", "medium", "wide")
+    return {name: build_layout(raw.decode("utf-8", "replace")) for name, raw in zip(names, fields)}
+
+
+def animate(args: argparse.Namespace) -> int:
+    layouts = read_layouts()
+    fps = max(10.0, min(60.0, args.fps))
+    speed = max(5.0, min(120.0, args.speed))
+    half_width = max(3.0, min(30.0, args.half_width))
+    total_width = max(layout.width for layout in layouts.values())
+    duration = (total_width + 2.0 * half_width) / speed
+    interval = 1.0 / fps
+    token = secrets.token_hex(12)
+
+    if not schedule_watchdog(args.session, token, duration + 3.0):
+        return 1
+
+    first_frames = {
+        name: render_frame(layout, -half_width, half_width)
+        for name, layout in layouts.items()
+    }
+    if not set_initial_frames(args.session, token, first_frames):
+        return 1
+
+    start = time.monotonic()
+    frame_index = 1
+    consecutive_failures = 0
+    handled_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    previous_handlers = {item: signal.getsignal(item) for item in handled_signals}
+    for item in handled_signals:
+        signal.signal(item, interrupt_animation)
+    try:
+        while True:
+            deadline = start + frame_index * interval
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+
+            elapsed = time.monotonic() - start
+            at_end = elapsed >= duration
+            center = total_width + half_width if at_end else -half_width + speed * elapsed
+            frames = {
+                name: render_frame(layout, center, half_width)
+                for name, layout in layouts.items()
+            }
+            if set_frames(args.session, frames):
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    return 1
+
+            if at_end:
+                time.sleep(interval)
+                break
+
+            completed = math.floor((time.monotonic() - start) / interval)
+            frame_index = max(frame_index + 1, completed + 1)
+    except AnimationInterrupted:
+        return 0
+    finally:
+        clear_animation(args.session, token)
+        for item, previous in previous_handlers.items():
+            signal.signal(item, previous)
+    return 0
+
+
+def transition(args: argparse.Namespace) -> int:
+    payload = read_transition_payload()
+    layouts = payload.layouts
+    fixed_right_frames = payload.fixed_right_frames
+    target_frames = payload.target_frames
+    fps = max(10.0, min(60.0, args.fps))
+    duration = max(0.08, min(2.0, args.duration))
+    direction = args.direction
+    token = secrets.token_hex(12)
+    interval = 1.0 / fps
+
+    if not schedule_watchdog(args.session, token, duration + 3.0):
+        return 1
+
+    def frame(phase: float) -> dict[str, str]:
+        return {
+            name: tmux_literal(transition_text(layout, phase, direction))
+            for name, layout in layouts.items()
+        }
+
+    if not initialize_transition(
+        args.session,
+        token,
+        frame(0.0),
+        fixed_right_frames,
+        target_frames,
+        args.state_option,
+        args.state_value,
+    ):
+        return 1
+
+    start = time.monotonic()
+    frame_index = 1
+    consecutive_failures = 0
+    handled_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    previous_handlers = {item: signal.getsignal(item) for item in handled_signals}
+    for item in handled_signals:
+        signal.signal(item, interrupt_animation)
+    try:
+        while True:
+            deadline = start + frame_index * interval
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+
+            elapsed = time.monotonic() - start
+            raw_progress = min(1.0, elapsed / duration)
+            eased = 0.5 * (1.0 - math.cos(math.pi * raw_progress))
+            if set_transition_frames(args.session, frame(eased)):
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    return 1
+
+            if raw_progress >= 1.0:
+                time.sleep(interval)
+                break
+
+            completed = math.floor((time.monotonic() - start) / interval)
+            frame_index = max(frame_index + 1, completed + 1)
+    except AnimationInterrupted:
+        return 0
+    finally:
+        clear_animation(args.session, token)
+        for item, previous in previous_handlers.items():
+            signal.signal(item, previous)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Render smooth tmux status sweep frames.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    animate_parser = subparsers.add_parser("animate")
+    animate_parser.add_argument("--session", required=True)
+    animate_parser.add_argument("--fps", type=float, default=30.0)
+    animate_parser.add_argument("--speed", type=float, default=30.0)
+    animate_parser.add_argument("--half-width", type=float, default=10.0)
+
+    transition_parser = subparsers.add_parser("transition")
+    transition_parser.add_argument("--session", required=True)
+    transition_parser.add_argument("--fps", type=float, default=30.0)
+    transition_parser.add_argument("--duration", type=float, default=0.35)
+    transition_parser.add_argument("--direction", choices=("expand", "collapse"), required=True)
+    transition_parser.add_argument("--state-option", default="")
+    transition_parser.add_argument("--state-value", default="")
+
+    clear_parser = subparsers.add_parser("clear")
+    clear_parser.add_argument("--session", required=True)
+    clear_parser.add_argument("--token", required=True)
+
+    stop_parser = subparsers.add_parser("stop")
+    stop_parser.add_argument("--session", required=True)
+    stop_parser.add_argument("--kind", choices=("sweep", "forecast"), required=True)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        if args.command == "animate":
+            return animate(args)
+        if args.command == "transition":
+            return transition(args)
+        if args.command == "stop":
+            return stop_animation(args)
+        return 0 if clear_animation(args.session, args.token) else 1
+    except (OSError, ValueError, UnicodeError) as exc:
+        print(f"tmux-status-sweep: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
